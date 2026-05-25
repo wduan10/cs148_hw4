@@ -88,37 +88,124 @@ def get_args():
     return p.parse_args()
 
 
-def load_vp_model(checkpoint: str, device) -> tuple[VPSDE, UNet]:
-    raise NotImplementedError("Fill in VPSDE and UNet loading.")
+def load_vp_model(checkpoint: str, device, beta_min=0.01, beta_max=5.0, T=1000):
+    sde   = VPSDE(beta_min=beta_min, beta_max=beta_max, T=T)
+    model = UNet(in_channels=1, base_channels=64).to(device)
+    model.load_state_dict(torch.load(checkpoint, map_location=device))
+    model.eval()
+    return sde, model
 
 
-def load_rf_model(checkpoint: str, device) -> tuple[RectifiedFlow, UNet]:
-    raise NotImplementedError("Fill in RectifiedFlow and UNet loading.")
+def load_rf_model(checkpoint: str, device):
+    flow  = RectifiedFlow()
+    model = UNet(in_channels=1, base_channels=64).to(device)
+    model.load_state_dict(torch.load(checkpoint, map_location=device))
+    model.eval()
+    return flow, model
 
+
+# ── Helpers that accept a pre-generated initial state ─────────────────────────
+
+@torch.no_grad()
+def em_from_init(sde: VPSDE, model, x_init: torch.Tensor, num_steps: int, device) -> torch.Tensor:
+    """VP Euler-Maruyama reverse SDE from a given initial x."""
+    dt = 1.0 / num_steps
+    timesteps = torch.linspace(1.0, dt, num_steps, device=device)
+    B    = x_init.shape[0]
+    ndim = x_init.dim() - 1
+    x    = x_init.clone().to(device)
+    for t_val in timesteps:
+        t      = torch.full((B,), t_val.item(), device=device)
+        score  = model(x, t)
+        beta_t = sde.beta(t).view(B, *([1] * ndim))
+        drift  = (0.5 * beta_t * x + beta_t * score) * dt
+        diff   = torch.sqrt(beta_t * dt) * torch.randn_like(x)
+        x      = x + drift + diff
+    return x
+
+
+@torch.no_grad()
+def rf_from_init(model, x_init: torch.Tensor, num_steps: int, device) -> torch.Tensor:
+    """Rectified Flow Euler ODE from a given initial x."""
+    dt = 1.0 / num_steps
+    B  = x_init.shape[0]
+    x  = x_init.clone().to(device)
+    for i in range(num_steps):
+        t = torch.full((B,), i * dt, device=device)
+        x = x + model(x, t) * dt
+    return x
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    args = get_args()
+    args   = get_args()
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
-    shape = (args.n_samples, 1, 28, 28)
+    shape  = (args.n_samples, 1, 28, 28)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     if args.method == "em":
-        # TODO (5.C.iii)
-        raise NotImplementedError
+        sde, model = load_vp_model(
+            args.checkpoint, device, args.beta_min, args.beta_max, args.T)
+        samples = sde.euler_maruyama(model, shape, num_steps=args.num_steps, device=device)
+        save_grid(samples, args.out,
+                  title=f"VP Euler-Maruyama ({args.num_steps} steps)")
 
     elif args.method == "pc":
-        # TODO (5.C.iv)
-        raise NotImplementedError
+        sde, model = load_vp_model(
+            args.checkpoint, device, args.beta_min, args.beta_max, args.T)
+        samples = sde.predictor_corrector(
+            model, shape,
+            num_steps=args.num_steps,
+            n_corrector=args.n_corrector,
+            snr=args.snr,
+            device=device,
+        )
+        save_grid(samples, args.out,
+                  title=f"VP PC ({args.num_steps} steps, {args.n_corrector} correctors)")
 
     elif args.method == "rectflow":
-        # TODO (6.B / 6.C)
-        raise NotImplementedError
+        flow, model = load_rf_model(args.checkpoint, device)
+        samples = flow.euler_sample(model, shape, num_steps=args.num_steps, device=device)
+        save_grid(samples, args.out,
+                  title=f"Rectified Flow Euler ({args.num_steps} steps)")
 
     elif args.method == "all":
-        # TODO (6.D) — generate 8 fixed-seed samples from each method and
-        # arrange them in a 4×8 grid as specified in Problem 6.D.
-        raise NotImplementedError
+        # ── 6.D: 4×8 side-by-side grid with 8 fixed seeds ────────────────
+        n_seeds = 8
+        torch.manual_seed(args.seed)
+        base_noise = torch.randn(n_seeds, 1, 28, 28, device=device)  # shared base noise
+
+        rows = []
+        row_labels = []
+
+        # Row 1: DDPM EM (1000 steps)
+        sde, vp_model = load_vp_model(
+            args.vp_checkpoint, device, args.beta_min, args.beta_max, args.T)
+        t1     = torch.ones(n_seeds, device=device)
+        sigma1 = sde.sigma(t1).view(n_seeds, 1, 1, 1)
+        rows.append(em_from_init(sde, vp_model, base_noise * sigma1, 1000, device))
+        row_labels.append("DDPM EM (1000 steps)")
+
+        # Row 2: Rectified Flow (100 steps)
+        flow, rf_model = load_rf_model(args.rf_checkpoint, device)
+        rows.append(rf_from_init(rf_model, base_noise, 100, device))
+        row_labels.append("Rect. Flow (100 steps)")
+
+        # Row 3: Rectified Flow (1 step)
+        rows.append(rf_from_init(rf_model, base_noise, 1, device))
+        row_labels.append("Rect. Flow (1 step)")
+
+        # Row 4: Reflow (1 step)
+        flow2, reflow_model = load_rf_model(args.reflow_checkpoint, device)
+        rows.append(rf_from_init(reflow_model, base_noise, 1, device))
+        row_labels.append("Reflow (1 step)")
+
+        all_samples = torch.cat(rows, dim=0)   # (32, 1, 28, 28)
+        save_grid(all_samples, args.out, nrow=n_seeds,
+                  title=" | ".join(row_labels))
+        print("Row order:", row_labels)
 
 
 if __name__ == "__main__":
